@@ -12,6 +12,127 @@ from tensorflow.keras import layers, losses
 from tensorflow.keras.datasets import mnist
 from tensorflow.keras.models import Model
 
+from sklearn.decomposition import PCA
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
+from sklearn.manifold import TSNE, Isomap
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.metrics import mean_squared_error
+from time import time
+
+# Adversarial autoencoder
+class AdversarialAutoencoder(tf.keras.Model):
+    def __init__(self, latent_dim, shape):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.shape = shape
+        self.encoder = tf.keras.Sequential([
+            layers.Flatten(),
+            layers.Dense(latent_dim, activation='relu'),
+        ])
+        self.decoder = tf.keras.Sequential([
+            layers.Dense(np.prod(shape), activation='sigmoid'),
+            layers.Reshape(shape)
+        ])
+        self.discriminator = tf.keras.Sequential([
+            layers.Dense(128, activation='relu'),
+            layers.Dense(1, activation='sigmoid')
+        ])
+
+    def compile(self, ae_optimizer, d_optimizer, loss_fn):
+        super().compile()
+        self.ae_optimizer = ae_optimizer
+        self.d_optimizer = d_optimizer
+        self.loss_fn = loss_fn
+        self.bce = tf.keras.losses.BinaryCrossentropy()
+
+    def train_step(self, data):
+        x = data
+        batch_size = tf.shape(x)[0]
+
+        # Encode
+        with tf.GradientTape(persistent=True) as tape:
+            z = self.encoder(x)
+            x_reconstructed = self.decoder(z)
+
+            real = tf.random.normal(shape=(batch_size, self.latent_dim))
+            fake = z
+
+            real_output = self.discriminator(real)
+            fake_output = self.discriminator(fake)
+
+            ae_loss = self.loss_fn(x, x_reconstructed)
+            d_loss = self.bce(tf.ones_like(real_output), real_output) + \
+                     self.bce(tf.zeros_like(fake_output), fake_output)
+
+        grads_ae = tape.gradient(ae_loss, self.encoder.trainable_variables + self.decoder.trainable_variables)
+        grads_d = tape.gradient(d_loss, self.discriminator.trainable_variables)
+
+        self.ae_optimizer.apply_gradients(zip(grads_ae, self.encoder.trainable_variables + self.decoder.trainable_variables))
+        self.d_optimizer.apply_gradients(zip(grads_d, self.discriminator.trainable_variables))
+
+        return {"ae_loss": ae_loss, "d_loss": d_loss}
+
+# Comparison setup
+def evaluate_methods(x_train, y_train, x_test, y_test, latent_dim=10):
+    results = {}
+
+    # Autoencoder
+    ae = train_autoencoder(x_train, x_test, latent_dim)
+    encoded_ae = ae.encoder(x_test).numpy()
+    decoded_ae = ae.decoder(encoded_ae).numpy()
+    results["AE"] = {
+        "recon": mean_squared_error(x_test.reshape(len(x_test), -1), decoded_ae.reshape(len(x_test), -1)),
+        "comp_ratio": np.prod(x_test.shape[1:]) / latent_dim,
+        "time": None
+    }
+
+    # PCA
+    start = time()
+    pca = PCA(n_components=latent_dim).fit(x_train.reshape(len(x_train), -1))
+    encoded = pca.transform(x_test.reshape(len(x_test), -1))
+    recon = pca.inverse_transform(encoded)
+    duration = time() - start
+    results["PCA"] = {
+        "recon": mean_squared_error(x_test.reshape(len(x_test), -1), recon),
+        "comp_ratio": np.prod(x_test.shape[1:]) / latent_dim,
+        "time": duration
+    }
+
+    # LDA
+    start = time()
+    lda = LDA(n_components=1).fit(x_train.reshape(len(x_train), -1), y_train)
+    encoded = lda.transform(x_test.reshape(len(x_test), -1))
+    duration = time() - start
+    results["LDA"] = {
+        "comp_ratio": np.prod(x_test.shape[1:]) / 1,
+        "time": duration,
+        "recon": None  # no reconstruction in LDA
+    }
+
+    # t-SNE
+    start = time()
+    tsne = TSNE(n_components=min(3, latent_dim)).fit_transform(x_test[:1000].reshape(1000, -1))
+    duration = time() - start
+    results["t-SNE"] = {
+        "comp_ratio": np.prod(x_test.shape[1:]) / latent_dim,
+        "time": duration,
+        "recon": None  # no reconstruction in t-SNE
+    }
+
+    # Isomap
+    start = time()
+    isomap = Isomap(n_components=latent_dim).fit(x_test[:1000].reshape(1000, -1))
+    encoded = isomap.transform(x_test[:1000].reshape(1000, -1))
+    duration = time() - start
+    results["Isomap"] = {
+        "comp_ratio": np.prod(x_test.shape[1:]) / latent_dim,
+        "time": duration,
+        "recon": None  # no reconstruction in Isomap
+    }
+
+    return results
+
+
 def load_mnist_data():
   #Loading mnist dataset
   (x_train, y_train), (x_test, y_test) = mnist.load_data()
